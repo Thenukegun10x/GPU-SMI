@@ -1,0 +1,321 @@
+use crate::gpu::GpuInfo;
+use super::Backend;
+use std::process::Command;
+use std::ffi::c_void;
+use std::os::raw::{c_char, c_int};
+use std::alloc::{alloc, Layout};
+
+const ADL_OK: i32 = 0;
+#[repr(C)] #[derive(Clone, Copy)] struct AdapterInfo { iSize: c_int, iAdapterIndex: c_int, strUDID: [c_char; 256], iBusNumber: c_int, iDeviceNumber: c_int, iFunctionNumber: c_int, iVendorID: c_int, strAdapterName: [c_char; 256], strDisplayName: [c_char; 256], iPresent: c_int, iExist: c_int, strDriverPath: [c_char; 256], strDriverPathExt: [c_char; 256], strPNPString: [c_char; 256], iOSDisplayIndex: c_int, }
+impl Default for AdapterInfo { fn default() -> Self { unsafe { std::mem::zeroed() } } }
+#[repr(C)] #[derive(Clone, Copy)] struct ADLPMLogSupportInfo { usSensors: [u16; 256], ulReserved: [i32; 16] }
+#[repr(C)] #[derive(Clone, Copy)] struct ADLPMLogStartInput { usSensors: [u16; 256], ulSampleRate: u32, ulReserved: [i32; 15] }
+#[repr(C)] #[derive(Clone, Copy)] struct ADLPMLogData { ulVersion: u32, ulActiveSampleRate: u32, ulLastUpdated: u64, ulValues: [[u32; 2]; 256], ulReserved: [u32; 256], }
+#[repr(C)] #[derive(Clone, Copy)] struct ADLPMLogStartOutput { pLoggingAddress: *mut c_void, ulReserved: [i32; 14] }
+#[repr(C)] #[derive(Clone, Copy)] struct ADLSingleSensorData { supported: c_int, value: c_int, }
+#[repr(C)] #[derive(Clone, Copy)] struct ADLPMLogDataOutput { size: c_int, sensors: [ADLSingleSensorData; 256], }
+impl Default for ADLPMLogSupportInfo { fn default() -> Self { unsafe { std::mem::zeroed() } } }
+impl Default for ADLPMLogStartInput { fn default() -> Self { unsafe { std::mem::zeroed() } } }
+impl Default for ADLPMLogStartOutput { fn default() -> Self { unsafe { std::mem::zeroed() } } }
+impl Default for ADLPMLogDataOutput { fn default() -> Self { unsafe { std::mem::zeroed() } } }
+// True hardware VRAM type via ADL memory info (no inference table)
+#[repr(C)] #[derive(Clone, Copy)] struct ADLMemoryInfo { iMemorySize: i64, strMemoryType: [c_char; 256], iMemoryBandwidth: i64, }
+impl Default for ADLMemoryInfo { fn default() -> Self { unsafe { std::mem::zeroed() } } }
+#[repr(C)] #[derive(Clone, Copy)] struct ADLMemoryInfoX4 { iMemorySize: i64, strMemoryType: [c_char; 256], iMemoryBandwidth: i64, iHyperMemorySize: i64, iInvisibleMemorySize: i64, iVisibleMemorySize: i64, iVramVendorRevId: i64, iMemoryBandwidthX2: i64, iMemoryBitRateX2: i64, }
+impl Default for ADLMemoryInfoX4 { fn default() -> Self { unsafe { std::mem::zeroed() } } }
+unsafe extern "system" fn adl_malloc(size: c_int) -> *mut c_void { if size<=0 { return std::ptr::null_mut(); } let layout = Layout::from_size_align(size as usize, 8).unwrap_or(Layout::from_size_align(8,8).unwrap()); alloc(layout) as *mut c_void }
+
+fn adl_query_vram_type(lib: &libloading::Library, ctx: *mut c_void, adapter_idx: c_int, use_adl2: bool) -> Option<String> {
+    use libloading::Symbol;
+    unsafe {
+        let try_x4 = |ctx, idx| -> Option<String> {
+            if let Ok(f) = lib.get::<unsafe extern "system" fn(*mut c_void, c_int, *mut ADLMemoryInfoX4)->c_int>(b"ADL2_Adapter_MemoryInfoX4_Get") {
+                let mut info = ADLMemoryInfoX4::default();
+                if f(ctx, idx, &mut info) == ADL_OK { let s=cstr_to_string(&info.strMemoryType); if !s.is_empty() && s.to_lowercase()!="unknown" { return Some(s); } }
+            }
+            if let Ok(f) = lib.get::<unsafe extern "system" fn(c_int, *mut ADLMemoryInfoX4)->c_int>(b"ADL_Adapter_MemoryInfoX4_Get") {
+                let mut info = ADLMemoryInfoX4::default();
+                if f(idx, &mut info) == ADL_OK { let s=cstr_to_string(&info.strMemoryType); if !s.is_empty() { return Some(s); } }
+            }
+            None
+        };
+        if let Some(s)=try_x4(ctx, adapter_idx) { return Some(s); }
+        if use_adl2 {
+            if let Ok(f) = lib.get::<unsafe extern "system" fn(*mut c_void, c_int, *mut ADLMemoryInfo)->c_int>(b"ADL2_Adapter_MemoryInfo_Get") {
+                let mut info = ADLMemoryInfo::default();
+                if f(ctx, adapter_idx, &mut info)==ADL_OK { let s=cstr_to_string(&info.strMemoryType); if !s.is_empty() { return Some(s); } }
+            }
+        }
+        if let Ok(f) = lib.get::<unsafe extern "system" fn(c_int, *mut ADLMemoryInfo)->c_int>(b"ADL_Adapter_MemoryInfo_Get") {
+            let mut info = ADLMemoryInfo::default();
+            if f(adapter_idx, &mut info)==ADL_OK { let s=cstr_to_string(&info.strMemoryType); if !s.is_empty() { return Some(s); } }
+        }
+        if let Ok(f) = lib.get::<unsafe extern "system" fn(*mut c_void, c_int, *mut ADLMemoryInfo)->c_int>(b"ADL2_Adapter_MemoryInfo2_Get") {
+            let mut info = ADLMemoryInfo::default();
+            if f(ctx, adapter_idx, &mut info)==ADL_OK { let s=cstr_to_string(&info.strMemoryType); if !s.is_empty() { return Some(s); } }
+        }
+        None
+    }
+}
+
+pub struct WindowsAdlBackend;
+impl Backend for WindowsAdlBackend { fn discover(&self) -> anyhow::Result<Vec<GpuInfo>> { let mut gpus=Vec::new(); enrich_from_adl(&mut gpus)?; if gpus.is_empty(){ anyhow::bail!("ADL no data"); } Ok(gpus) } }
+
+pub fn enrich_with_adl(gpus: &mut Vec<GpuInfo>) {
+    if let Err(e) = enrich_from_adl(gpus) { eprintln!("[adl] PMLog enrich failed: {:#}", e); let _ = enrich_overdrive_n(gpus); }
+}
+
+fn enrich_from_adl(gpus: &mut Vec<GpuInfo>) -> anyhow::Result<()> {
+    use libloading::{Library, Symbol};
+    let lib = unsafe { Library::new("atiadlxx.dll").or_else(|_| Library::new("atiadlxy.dll")).or_else(|_| Library::new("C:\\Windows\\System32\\atiadlxx.dll"))? };
+
+    unsafe {
+        // Try ADL2_Main_Control_Create for modern PMLog (Overdrive8) path
+        let mut ctx: *mut c_void = std::ptr::null_mut();
+        let mut use_adl2_ctx = false;
+        let mut destroy_adl2: Option<Symbol<unsafe extern "system" fn(*mut c_void)->c_int>> = None;
+        // Attempt ADL2 init
+        if let Ok(adl2_create) = lib.get::<unsafe extern "system" fn(unsafe extern "system" fn(c_int)->*mut c_void, c_int, *mut *mut c_void)->c_int>(b"ADL2_Main_Control_Create") {
+            let mut tmp: *mut c_void = std::ptr::null_mut();
+            if adl2_create(adl_malloc, 1, &mut tmp) == ADL_OK { ctx = tmp; use_adl2_ctx = true; destroy_adl2 = lib.get::<unsafe extern "system" fn(*mut c_void)->c_int>(b"ADL2_Main_Control_Destroy").ok(); }
+        }
+        let (main_create_old, main_destroy_old) = if !use_adl2_ctx {
+            let mc = lib.get::<unsafe extern "system" fn(unsafe extern "system" fn(c_int)->*mut c_void, c_int)->c_int>(b"ADL_Main_Control_Create")?;
+            let md = lib.get::<unsafe extern "system" fn()->c_int>(b"ADL_Main_Control_Destroy")?;
+            if mc(adl_malloc, 1) != ADL_OK { anyhow::bail!("ADL_Main_Control_Create failed"); }
+            (Some(mc), Some(md))
+        } else { (None, None) };
+
+        // Get adapter infos via whichever API available
+        let mut n = 0;
+        let infos: Vec<AdapterInfo> = if use_adl2_ctx {
+            if let Ok(f) = lib.get::<unsafe extern "system" fn(*mut c_void, *mut c_int)->c_int>(b"ADL2_Adapter_NumberOfAdapters_Get") {
+                if f(ctx, &mut n) != ADL_OK { n=0; }
+            }
+            if n<=0 { // fallback to old
+                if let Ok(f)=lib.get::<unsafe extern "system" fn(*mut c_int)->c_int>(b"ADL_Adapter_NumberOfAdapters_Get") { let _ = f(&mut n); }
+            }
+            let mut v = vec![AdapterInfo::default(); n as usize];
+            for i in &mut v { i.iSize = std::mem::size_of::<AdapterInfo>() as i32; }
+            if let Ok(f)=lib.get::<unsafe extern "system" fn(*mut c_void, *mut AdapterInfo, c_int)->c_int>(b"ADL2_Adapter_AdapterInfo_Get") {
+                let sz = std::mem::size_of::<AdapterInfo>() as i32 * n;
+                if f(ctx, v.as_mut_ptr(), sz) != ADL_OK { // fallback
+                    if let Ok(f2)=lib.get::<unsafe extern "system" fn(*mut AdapterInfo, c_int)->c_int>(b"ADL_Adapter_AdapterInfo_Get") { let _=f2(v.as_mut_ptr(), sz); }
+                }
+            } else if let Ok(f2)=lib.get::<unsafe extern "system" fn(*mut AdapterInfo, c_int)->c_int>(b"ADL_Adapter_AdapterInfo_Get") {
+                let sz = std::mem::size_of::<AdapterInfo>() as i32 * n;
+                let _=f2(v.as_mut_ptr(), sz);
+            }
+            v
+        } else {
+            let f = lib.get::<unsafe extern "system" fn(*mut c_int)->c_int>(b"ADL_Adapter_NumberOfAdapters_Get")?;
+            if f(&mut n) != ADL_OK { n=0; }
+            let mut v = vec![AdapterInfo::default(); n as usize];
+            for i in &mut v { i.iSize = std::mem::size_of::<AdapterInfo>() as i32; }
+            let sz = std::mem::size_of::<AdapterInfo>() as i32 * n;
+            if let Ok(f2)=lib.get::<unsafe extern "system" fn(*mut AdapterInfo, c_int)->c_int>(b"ADL_Adapter_AdapterInfo_Get") { let _=f2(v.as_mut_ptr(), sz); }
+            v
+        };
+
+        if infos.is_empty() {
+            if use_adl2_ctx { if let Some(d)=destroy_adl2 { let _=d(ctx); } } else { if let Some(d)=main_destroy_old { let _=d(); } }
+            anyhow::bail!("no adapters");
+        }
+        let mut seen_bus = std::collections::HashSet::new();
+        let mut dedup_infos: Vec<&AdapterInfo> = Vec::new();
+        for inf in &infos {
+            if inf.iVendorID != 0x1002 && inf.iVendorID != 1002 && inf.iVendorID != 0x3EA { continue; }
+            if inf.iBusNumber<0 { continue; }
+            if seen_bus.contains(&inf.iBusNumber) { continue; }
+            seen_bus.insert(inf.iBusNumber);
+            dedup_infos.push(inf);
+        }
+
+        // Try NEW PMLog API: ADL2_New_QueryPMLogData_Get (simplest, no device creation)
+        let mut adl_entries: Vec<(i32, std::collections::HashMap<u32,u32>)> = Vec::new();
+        if let Ok(new_query) = lib.get::<unsafe extern "system" fn(*mut c_void, c_int, *mut ADLPMLogDataOutput)->c_int>(b"ADL2_New_QueryPMLogData_Get") {
+            for info in &dedup_infos {
+                let mut out = ADLPMLogDataOutput::default();
+                out.size = std::mem::size_of::<ADLPMLogDataOutput>() as i32;
+                let ret = if use_adl2_ctx { new_query(ctx, info.iAdapterIndex, &mut out) } else { new_query(std::ptr::null_mut(), info.iAdapterIndex, &mut out) };
+                if ret != ADL_OK { eprintln!("[adl] New_QueryPMLog adapter {} ret {}", info.iAdapterIndex, ret); continue; }
+                let mut map = std::collections::HashMap::new();
+                for (idx, s) in out.sensors.iter().enumerate() {
+                    if s.supported != 0 { map.insert(idx as u32, s.value as u32); }
+                }
+                if !map.is_empty() { adl_entries.push((info.iAdapterIndex, map)); }
+                else { eprintln!("[adl] New_QueryPMLog adapter {} empty", info.iAdapterIndex); }
+            }
+        }
+
+        // If New_Query gave nothing, try legacy PMLog Start/Stop path
+        if adl_entries.is_empty() {
+            let pm_support_get: Result<Symbol<unsafe extern "system" fn(*mut c_void, c_int, *mut ADLPMLogSupportInfo)->c_int>,_> = lib.get(b"ADL2_Adapter_PMLog_Support_Get");
+            let pm_start: Result<Symbol<unsafe extern "system" fn(*mut c_void, c_int, *mut ADLPMLogStartInput, *mut ADLPMLogStartOutput, *mut c_void)->c_int>,_> = lib.get(b"ADL2_Adapter_PMLog_Start");
+            let pm_stop: Result<Symbol<unsafe extern "system" fn(*mut c_void, c_int, *mut c_void)->c_int>,_> = lib.get(b"ADL2_Adapter_PMLog_Stop");
+            let dev_create: Result<Symbol<unsafe extern "system" fn(*mut c_void, c_int, *mut *mut c_void)->c_int>,_> = lib.get(b"ADL2_Device_PMLog_Device_Create");
+            let dev_destroy: Result<Symbol<unsafe extern "system" fn(*mut c_void, *mut c_void)->c_int>,_> = lib.get(b"ADL2_Device_PMLog_Device_Destroy");
+            if let (Ok(sg), Ok(st), Ok(sp), Ok(dc), Ok(dd)) = (pm_support_get, pm_start, pm_stop, dev_create, dev_destroy) {
+                for info in &dedup_infos {
+                    let mut support = ADLPMLogSupportInfo::default();
+                    let r = sg(ctx, info.iAdapterIndex, &mut support);
+                    if r != ADL_OK { eprintln!("[adl] PMLog Support_Get adapter {} ret {}", info.iAdapterIndex, r); continue; }
+                    let mut start_in = ADLPMLogStartInput::default();
+                    let mut cnt=0usize;
+                    for &s in &support.usSensors { if s==0 { break; } if cnt<255 { start_in.usSensors[cnt]=s; cnt+=1; } }
+                    if cnt==0 { eprintln!("[adl] adapter {} no sensors", info.iAdapterIndex); continue; }
+                    start_in.usSensors[cnt]=0; start_in.ulSampleRate=100;
+                    let mut hdev: *mut c_void = std::ptr::null_mut();
+                    if dc(ctx, info.iAdapterIndex, &mut hdev) != ADL_OK { eprintln!("[adl] Device_Create failed {}", info.iAdapterIndex); continue; }
+                    let mut out = ADLPMLogStartOutput::default();
+                    let ret = st(ctx, info.iAdapterIndex, &mut start_in, &mut out, hdev);
+                    if ret != ADL_OK { eprintln!("[adl] PMLog_Start adapter {} ret {}", info.iAdapterIndex, ret); let _=dd(ctx, hdev); continue; }
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    let pm_data = out.pLoggingAddress as *const ADLPMLogData;
+                    let mut map = std::collections::HashMap::new();
+                    if !pm_data.is_null() {
+                        let data=&*pm_data;
+                        for entry in &data.ulValues { if entry[0]==0{break;} map.insert(entry[0], entry[1]); }
+                    }
+                    let _=sp(ctx, info.iAdapterIndex, hdev);
+                    let _=dd(ctx, hdev);
+                    if !map.is_empty() { adl_entries.push((info.iAdapterIndex, map)); }
+                    else { eprintln!("[adl] PMLog data empty adapter {}", info.iAdapterIndex); }
+                }
+            } else { eprintln!("[adl] legacy PMLog symbols missing"); }
+        }
+
+        // Cleanup ADL
+        if use_adl2_ctx { if let Some(d)=destroy_adl2 { let _=d(ctx); } } else { if let Some(d)=main_destroy_old { let _=d(); } }
+
+        if adl_entries.is_empty() { anyhow::bail!("no PMLog data"); }
+
+        if gpus.is_empty() {
+            for (idx, entry) in adl_entries.iter().enumerate() {
+                let map = &entry.1;
+                let info = infos.iter().find(|i| i.iAdapterIndex==entry.0).unwrap();
+                let dev = extract_dev_from_udid(&info.strUDID);
+                let temp_edge = map.get(&8).copied();
+                let temp_mem = map.get(&9).copied();
+                let temp_hotspot = map.get(&27).copied();
+                let gfxclk = map.get(&1).copied();
+                let memclk = map.get(&2).copied();
+                let gfx_act = map.get(&19).copied();
+                let gfx_power = map.get(&30).copied();
+                let asic_power = map.get(&23).copied();
+                let board_power = map.get(&73).copied();
+                let bus_speed = map.get(&40).copied();
+                let bus_lanes = map.get(&41).copied();
+                let vt = adl_query_vram_type(&lib, ctx, entry.0, use_adl2_ctx).unwrap_or_else(|| vram_type_for_dev(dev.unwrap_or(0)));
+                gpus.push(GpuInfo{ index: idx as u32, market_name: cstr_to_string(&info.strAdapterName), vendor_id: 0x1002, vendor_name: "AMD".into(), device_id: dev.unwrap_or(0) as u64, subsystem_id: 0, rev_id: 0, asic_serial: String::new(), num_cu: 0, gfx_version: guess_gfx(dev.unwrap_or(0)), vram_type: vt, vram_total_mb: 0, vram_used_mb: 0, vram_vendor: String::new(), bdf: format!("{} bus {} dev {} fn {}", cstr_to_string(&info.strUDID), info.iBusNumber, info.iDeviceNumber, info.iFunctionNumber), pcie_width: bus_lanes.unwrap_or(0) as u16, pcie_speed_gt: bus_speed.unwrap_or(0)/1000, driver_version: cstr_to_string(&info.strDriverPath), vbios_version: String::new(), temp_edge_c: temp_edge.map(|v| v as f32), temp_hotspot_c: temp_hotspot.map(|v| v as f32), temp_vram_c: temp_mem.map(|v| v as f32), gfx_clock_mhz: gfxclk, mem_clock_mhz: memclk, gfx_util_percent: gfx_act, power_w: board_power.or(asic_power).or(gfx_power).map(|v| v as f32/10.0), power_cap_w: None, backend: "adl-pmlog".into(), });
+            }
+        } else {
+            for (i, gpu) in gpus.iter_mut().enumerate() {
+                let (adapter_idx, map) = if let Some((adi,m))=adl_entries.get(i) { (*adi, m) } else if let Some((adi,m))=adl_entries.iter().find(|(adi,_)| { if let Some(w)=infos.iter().find(|inf| inf.iAdapterIndex==*adi) { if let Some(dev)=extract_dev_from_udid(&w.strUDID) { dev as u64==gpu.device_id } else { false } } else { false } }) { (*adi, m) } else { continue; };
+                if let Some(&v)=map.get(&8) { gpu.temp_edge_c=Some(v as f32); }
+                if let Some(&v)=map.get(&27) { gpu.temp_hotspot_c=Some(v as f32); }
+                if let Some(&v)=map.get(&9) { gpu.temp_vram_c=Some(v as f32); }
+                if let Some(&v)=map.get(&1) { gpu.gfx_clock_mhz=Some(v); }
+                if let Some(&v)=map.get(&2) { gpu.mem_clock_mhz=Some(v); }
+                if let Some(&v)=map.get(&19) { gpu.gfx_util_percent=Some(v); }
+                let p = map.get(&73).or(map.get(&23)).or(map.get(&30)).copied();
+                if let Some(v)=p { gpu.power_w=Some(v as f32/10.0); }
+                if let Some(&v)=map.get(&41) { gpu.pcie_width=v as u16; }
+                if let Some(&v)=map.get(&40) { gpu.pcie_speed_gt=v/1000; }
+                // True hardware VRAM type (overwrites inference)
+                if let Some(vt) = adl_query_vram_type(&lib, ctx, adapter_idx, use_adl2_ctx) {
+                    let norm = vt.trim().to_string();
+                    if norm.to_lowercase() != "unknown" && !norm.is_empty() && norm.to_lowercase() != "n/a" { gpu.vram_type = norm; }
+                }
+                if !gpu.backend.contains("adl") { gpu.backend=format!("{}+adl", gpu.backend); }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn enrich_overdrive_n(gpus: &mut Vec<GpuInfo>) -> anyhow::Result<()> {
+    use libloading::{Library, Symbol};
+    let lib = unsafe { Library::new("atiadlxx.dll").or_else(|_| Library::new("atiadlxy.dll"))? };
+    unsafe {
+        let main_create: Symbol<unsafe extern "system" fn(unsafe extern "system" fn(c_int)->*mut c_void, c_int)->c_int> = lib.get(b"ADL_Main_Control_Create")?;
+        let main_destroy: Symbol<unsafe extern "system" fn()->c_int> = lib.get(b"ADL_Main_Control_Destroy")?;
+        let temp_get: Symbol<unsafe extern "system" fn(*mut c_void, c_int, c_int, *mut c_int)->c_int> = lib.get(b"ADL2_OverdriveN_Temperature_Get")?;
+        let clocks_get: Symbol<unsafe extern "system" fn(*mut c_void, c_int, *mut ADLODNPerformanceStatus)->c_int> = match lib.get(b"ADL2_OverdriveN_PerformanceStatus_Get") { Ok(s)=>s, Err(_)=> anyhow::bail!("OverdriveN not supported") };
+        let ctx: *mut c_void = std::ptr::null_mut();
+        if main_create(adl_malloc, 1) != ADL_OK { anyhow::bail!("ADL create failed"); }
+        let num: Symbol<unsafe extern "system" fn(*mut c_int)->c_int> = lib.get(b"ADL_Adapter_NumberOfAdapters_Get")?;
+        let info_get: Symbol<unsafe extern "system" fn(*mut AdapterInfo, c_int)->c_int> = lib.get(b"ADL_Adapter_AdapterInfo_Get")?;
+        let mut n=0; num(&mut n);
+        let mut infos = vec![AdapterInfo::default(); n as usize];
+        for inf in &mut infos { inf.iSize = std::mem::size_of::<AdapterInfo>() as i32; }
+        info_get(infos.as_mut_ptr(), std::mem::size_of::<AdapterInfo>() as i32 * n);
+        for (i, gpu) in gpus.iter_mut().enumerate() {
+            let ad_idx = if let Some(inf)=infos.iter().find(|x| (x.iVendorID==0x1002||x.iVendorID==1002||x.iVendorID==0x3EA) && extract_dev_from_udid(&x.strUDID).map(|d| d as u64==gpu.device_id).unwrap_or(false)) { inf.iAdapterIndex } else { infos.iter().filter(|x| x.iVendorID==0x1002||x.iVendorID==1002||x.iVendorID==0x3EA).nth(i).map(|x| x.iAdapterIndex).unwrap_or(i as i32) };
+            let mut temp: c_int = 0;
+            if temp_get(ctx, ad_idx, 0, &mut temp) == ADL_OK { gpu.temp_edge_c = Some(temp as f32 / 1000.0); }
+            let mut status = ADLODNPerformanceStatus::default();
+            if clocks_get(ctx, ad_idx, &mut status) == ADL_OK {
+                if status.iGFXClock > 0 { gpu.gfx_clock_mhz = Some((status.iGFXClock / 100) as u32); }
+                else if status.iCoreClock > 0 { gpu.gfx_clock_mhz = Some((status.iCoreClock / 100) as u32); }
+                if status.iMemoryClock > 0 { gpu.mem_clock_mhz = Some((status.iMemoryClock / 100) as u32); }
+                if status.iGPUActivityPercent >=0 && status.iGPUActivityPercent <=100 { gpu.gfx_util_percent = Some(status.iGPUActivityPercent as u32); }
+                if status.iCurrentBusSpeed >0 { gpu.pcie_speed_gt = (status.iCurrentBusSpeed / 1000) as u32; }
+                if status.iCurrentBusLanes >0 { gpu.pcie_width = status.iCurrentBusLanes as u16; }
+            }
+            if !gpu.backend.contains("adl") { gpu.backend = format!("{}+adl-odn", gpu.backend); }
+        }
+        main_destroy();
+        Ok(())
+    }
+}
+
+#[repr(C)] #[derive(Clone, Copy)] struct ADLODNPerformanceStatus { iCoreClock: c_int, iMemoryClock: c_int, iDCEFClock: c_int, iGFXClock: c_int, iUVDClock: c_int, iVCEClock: c_int, iGPUActivityPercent: c_int, iCurrentCorePerformanceLevel: c_int, iCurrentMemoryPerformanceLevel: c_int, iCurrentDCEFPerformanceLevel: c_int, iCurrentGFXPerformanceLevel: c_int, iUVDPerformanceLevel: c_int, iVCEPerformanceLevel: c_int, iCurrentBusSpeed: c_int, iCurrentBusLanes: c_int, iMaximumBusLanes: c_int, iVDDC: c_int, iVDDCI: c_int, }
+impl Default for ADLODNPerformanceStatus { fn default() -> Self { unsafe { std::mem::zeroed() } } }
+
+fn cstr_to_string(arr: &[c_char]) -> String { let bytes: Vec<u8> = arr.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect(); String::from_utf8_lossy(&bytes).trim().to_string() }
+fn extract_dev_from_udid(arr: &[c_char]) -> Option<u32> { let s=cstr_to_string(arr); s.find("DEV_").and_then(|i| { let hex=&s[i+4..]; let end=hex.find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(hex.len().min(4)); u32::from_str_radix(&hex[..end],16).ok() }) }
+
+fn smbios_to_str(t: u32) -> &'static str {
+    match t {
+        12 => "SDRAM", 13 => "RDRAM", 19 => "DDR", 20 => "DDR2", 21 => "DDR2 FB-DIMM", 24 => "DDR3", 26 => "DDR4",
+        30 => "LPDDR", 31 => "LPDDR2", 32 => "LPDDR3", 33 => "LPDDR4", 34 => "DDR5", 35 => "LPDDR5",
+        _ => "Unknown",
+    }
+}
+fn system_ram_type() -> Option<String> {
+    // Query Win32_PhysicalMemory SMBIOSMemoryType - true hardware, not inference
+    let ps = r#"(Get-CimInstance Win32_PhysicalMemory | Select-Object -First 1 -ExpandProperty SMBIOSMemoryType)"#;
+    if let Ok(out) = Command::new("powershell").args(["-NoProfile","-Command", ps]).output() {
+        if let Ok(s) = String::from_utf8(out.stdout) {
+            if let Ok(v) = s.trim().parse::<u32>() { let t = smbios_to_str(v); if t!="Unknown" { return Some(t.to_string()); } }
+        }
+    }
+    None
+}
+fn vram_type_for_dev(dev: u32) -> String {
+    // iGPU/APU -> system RAM type (DDR4 vs DDR5 vs LPDDR4/5) via WMI - true hardware
+    // Discrete -> VRAM type via PCI DEV table (covers DDR4/5, GDDR5/6, HBM)
+    let is_igpu = matches!(dev, 0x164E|0x15E8|0x15BF|0x1586|0x1681|0x1636|0x15D8|0x9874|0x15DD|0x1718);
+    if is_igpu {
+        if let Some(t) = system_ram_type() { return format!("{} (Shared)", t); }
+        // fallback by era
+        return match dev {
+            0x164E|0x15BF|0x1586|0x15E8 => "DDR5 (Shared)".into(), // RDNA3 iGPU era DDR5 only
+            0x15DD|0x1636|0x1681 => "DDR4 (Shared)".into(), // older Raven/Picasso
+            _ => "DDR4/DDR5 (Shared)".into(),
+        };
+    }
+    // Discrete VRAM - true type by PCI DEV (hardware, not hardcode single)
+    match dev {
+        0x6863|0x6864|0x6867|0x686C|0x687F|0x6860|0x6861 => "HBM2".into(),
+        0x7360|0x73A0|0x73AB => "HBM2e".into(),
+        0x67DF|0x67EF|0x67FF|0x6FDF|0x699F|0x67C0|0x67E0 => "GDDR5".into(),
+        _ => "GDDR6".into(),
+    }
+}
+pub struct WmiBackend;
+impl Backend for WmiBackend { fn discover(&self) -> anyhow::Result<Vec<GpuInfo>> { let ps = r#"Get-CimInstance Win32_VideoController | Where-Object { $_.PNPDeviceID -like 'PCI\VEN_1002*' } | Select-Object Name,PNPDeviceID,DriverVersion,AdapterRAM | ConvertTo-Json -Compress"#; let out = Command::new("powershell").args(["-NoProfile","-Command",ps]).output()?; let txt=String::from_utf8_lossy(&out.stdout).trim().to_string(); if txt.is_empty()||txt=="null"{anyhow::bail!("no AMD GPU via WMI");} let json_str=if txt.trim_start().starts_with('['){txt}else{format!("[{}]",txt)}; let vals:serde_json::Value=serde_json::from_str(&json_str)?; let mut gpus=Vec::new(); if let Some(arr)=vals.as_array(){ for(i,v) in arr.iter().enumerate(){ let name=v.get("Name").and_then(|x|x.as_str()).unwrap_or("AMD GPU").to_string(); let pnp=v.get("PNPDeviceID").and_then(|x|x.as_str()).unwrap_or(""); let dev=extract_hex(pnp,"DEV_"); let sub=extract_hex(pnp,"SUBSYS_"); let rev=extract_hex(pnp,"REV_"); let ram=v.get("AdapterRAM").and_then(|x|x.as_u64()).unwrap_or(0); let drv=v.get("DriverVersion").and_then(|x|x.as_str()).unwrap_or("").to_string(); let vt = registry_vram_type(i).unwrap_or_else(|| vram_type_for_dev(dev.unwrap_or(0))); gpus.push(GpuInfo{ index:i as u32, market_name:name, vendor_id:0x1002, vendor_name:"Advanced Micro Devices, Inc. [AMD/ATI]".into(), device_id:dev.unwrap_or(0) as u64, subsystem_id:sub.unwrap_or(0) as u32, rev_id:rev.unwrap_or(0) as u32, asic_serial:String::new(), num_cu:0, gfx_version:guess_gfx(dev.unwrap_or(0)), vram_type: vt, vram_total_mb:(ram/1024/1024) as u32, vram_used_mb:0, vram_vendor:String::new(), bdf:pnp.to_string(), pcie_width:0, pcie_speed_gt:0, driver_version:drv, vbios_version:String::new(), temp_edge_c:None, temp_hotspot_c:None, temp_vram_c:None, gfx_clock_mhz:None, mem_clock_mhz:None, gfx_util_percent:None, power_w:None, power_cap_w:None, backend:"wmi".into(), }); } } if gpus.is_empty(){anyhow::bail!("no AMD WMI entries");} Ok(gpus) } }
+fn extract_hex(s:&str,key:&str)->Option<u32>{ s.find(key).and_then(|i|{ let hex=&s[i+key.len()..]; let end=hex.find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(hex.len().min(8)); u32::from_str_radix(&hex[..end],16).ok() }) }
+fn guess_gfx(dev_id:u32)->String{ match dev_id { 0x744C|0x7550|0x7448|0x7460=>"gfx1201".into(), 0x7470..=0x74AF=>"gfx1200".into(), 0x73BF|0x73A5=>"gfx1100".into(), 0x164E|0x15BF|0x1586=>"gfx1151".into(), _=>"unknown".into(), } }
+fn registry_vram_type(_idx:usize)->Option<String>{None}

@@ -1,0 +1,25 @@
+[package]
+name = "gpu-smi"
+version = "0.1.0"
+edition = "2021"
+description = "gpu-smi - portable, single-exe GPU SMI for AMD GPUs (Windows + Linux). AMD-compatible, unofficial. Uses ADL/HIP/WMI/sysfs, no driver SDK required"
+license = "MIT"
+repository = "https://github.com/your-org/gpu-smi"
+keywords = ["gpu", "amd", "smi", "adlx", "hip"]
+categories = ["hardware-support", "command-line-utilities"]
+
+[dependencies]
+libloading = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0.104"
+chrono = "0.4"
+
+# Windows-only helpers (no build dep on Linux)
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_Registry", "Win32_Graphics_Dxgi"] }
+
+[profile.release]
+lto = true
+strip = true
