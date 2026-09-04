@@ -1,3 +1,8 @@
+#![cfg(target_os = "windows")]
+// Empty on other platforms: this backend needs ADL/WMI/DXGI. Kept declared
+// (linux.rs stays compilable everywhere) so `cargo test` on Windows still
+// covers the cross-platform parsers; all uses are cfg(windows)-gated.
+
 use crate::gpu::GpuInfo;
 use super::Backend;
 use std::process::Command;
@@ -6,6 +11,30 @@ use std::os::raw::{c_char, c_int};
 use std::alloc::{alloc, Layout};
 
 const ADL_OK: i32 = 0;
+// SECURITY: DLL sideload guard. Windows resolves a bare name via app-dir first,
+// so a planted DLL next to this portable exe would win. Always try the absolute
+// System32/driver path first; only fall back to bare name for Wine or exotic
+// driver layouts.
+fn load_lib_secure(bare: &str) -> Result<libloading::Library, libloading::Error> {
+    unsafe {
+        let abs = format!("C:\\Windows\\System32\\{}", bare);
+        if let Ok(l) = libloading::Library::new(&abs) { return Ok(l); }
+        libloading::Library::new(bare)
+    }
+}
+fn load_adl_secure() -> Result<libloading::Library, libloading::Error> {
+    unsafe {
+        for p in [
+            "C:\\Windows\\System32\\atiadlxx.dll",
+            "C:\\Windows\\SysWOW64\\atiadlxx.dll",
+            "C:\\Windows\\System32\\atiadlxy.dll",
+        ] {
+            if let Ok(l) = libloading::Library::new(p) { return Ok(l); }
+        }
+        libloading::Library::new("atiadlxx.dll")
+            .or_else(|_| libloading::Library::new("atiadlxy.dll"))
+    }
+}
 #[repr(C)] #[derive(Clone, Copy)] struct AdapterInfo { iSize: c_int, iAdapterIndex: c_int, strUDID: [c_char; 256], iBusNumber: c_int, iDeviceNumber: c_int, iFunctionNumber: c_int, iVendorID: c_int, strAdapterName: [c_char; 256], strDisplayName: [c_char; 256], iPresent: c_int, iExist: c_int, strDriverPath: [c_char; 256], strDriverPathExt: [c_char; 256], strPNPString: [c_char; 256], iOSDisplayIndex: c_int, }
 impl Default for AdapterInfo { fn default() -> Self { unsafe { std::mem::zeroed() } } }
 #[repr(C)] #[derive(Clone, Copy)] struct ADLPMLogSupportInfo { usSensors: [u16; 256], ulReserved: [i32; 16] }
@@ -66,8 +95,8 @@ pub fn enrich_with_adl(gpus: &mut Vec<GpuInfo>) {
 }
 
 fn enrich_from_adl(gpus: &mut Vec<GpuInfo>) -> anyhow::Result<()> {
-    use libloading::{Library, Symbol};
-    let lib = unsafe { Library::new("atiadlxx.dll").or_else(|_| Library::new("atiadlxy.dll")).or_else(|_| Library::new("C:\\Windows\\System32\\atiadlxx.dll"))? };
+    use libloading::Symbol;
+    let lib = load_adl_secure()?;
 
     unsafe {
         // Try ADL2_Main_Control_Create for modern PMLog (Overdrive8) path
@@ -235,8 +264,8 @@ fn enrich_from_adl(gpus: &mut Vec<GpuInfo>) -> anyhow::Result<()> {
 }
 
 fn enrich_overdrive_n(gpus: &mut Vec<GpuInfo>) -> anyhow::Result<()> {
-    use libloading::{Library, Symbol};
-    let lib = unsafe { Library::new("atiadlxx.dll").or_else(|_| Library::new("atiadlxy.dll"))? };
+    use libloading::Symbol;
+    let lib = load_adl_secure()?;
     unsafe {
         let main_create: Symbol<unsafe extern "system" fn(unsafe extern "system" fn(c_int)->*mut c_void, c_int)->c_int> = lib.get(b"ADL_Main_Control_Create")?;
         let main_destroy: Symbol<unsafe extern "system" fn()->c_int> = lib.get(b"ADL_Main_Control_Destroy")?;
@@ -317,7 +346,7 @@ fn vram_type_for_dev(dev: u32) -> String {
 pub struct WmiBackend;
 impl Backend for WmiBackend { fn discover(&self) -> anyhow::Result<Vec<GpuInfo>> { let ps = r#"Get-CimInstance Win32_VideoController | Where-Object { $_.PNPDeviceID -like 'PCI\VEN_1002*' } | Select-Object Name,PNPDeviceID,DriverVersion,AdapterRAM | ConvertTo-Json -Compress"#; let out = Command::new("powershell").args(["-NoProfile","-Command",ps]).output()?; let txt=String::from_utf8_lossy(&out.stdout).trim().to_string(); if txt.is_empty()||txt=="null"{anyhow::bail!("no AMD GPU via WMI");} let json_str=if txt.trim_start().starts_with('['){txt}else{format!("[{}]",txt)}; let vals:serde_json::Value=serde_json::from_str(&json_str)?; let mut gpus=Vec::new(); if let Some(arr)=vals.as_array(){ for(i,v) in arr.iter().enumerate(){ let name=v.get("Name").and_then(|x|x.as_str()).unwrap_or("AMD GPU").to_string(); let pnp=v.get("PNPDeviceID").and_then(|x|x.as_str()).unwrap_or(""); let dev=extract_hex(pnp,"DEV_"); let sub=extract_hex(pnp,"SUBSYS_"); let rev=extract_hex(pnp,"REV_"); let ram=v.get("AdapterRAM").and_then(|x|x.as_u64()).unwrap_or(0); let drv=v.get("DriverVersion").and_then(|x|x.as_str()).unwrap_or("").to_string(); let vt = registry_vram_type(i).unwrap_or_else(|| vram_type_for_dev(dev.unwrap_or(0))); gpus.push(GpuInfo{ index:i as u32, market_name:name, vendor_id:0x1002, vendor_name:"Advanced Micro Devices, Inc. [AMD/ATI]".into(), device_id:dev.unwrap_or(0) as u64, subsystem_id:sub.unwrap_or(0) as u32, rev_id:rev.unwrap_or(0) as u32, asic_serial:String::new(), num_cu:0, gfx_version:guess_gfx(dev.unwrap_or(0)), vram_type: vt, vram_total_mb:(ram/1024/1024) as u32, vram_used_mb:0, vram_pinned_mb:0, vram_vendor:String::new(), bdf:pnp.to_string(), pcie_width:0, pcie_speed_gt:0, driver_version:drv, vbios_version:String::new(), temp_edge_c:None, temp_hotspot_c:None, temp_vram_c:None, gfx_clock_mhz:None, mem_clock_mhz:None, gfx_util_percent:None, power_w:None, power_cap_w:None, backend:"wmi".into(), processes: Vec::new(), }); } } if gpus.is_empty(){anyhow::bail!("no AMD WMI entries");} Ok(gpus) } }
 fn extract_hex(s:&str,key:&str)->Option<u32>{ s.find(key).and_then(|i|{ let hex=&s[i+key.len()..]; let end=hex.find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(hex.len().min(8)); u32::from_str_radix(&hex[..end],16).ok() }) }
-fn guess_gfx(dev_id:u32)->String{ match dev_id { 0x744C|0x7550|0x7448|0x7460=>"gfx1201".into(), 0x7470..=0x74AF=>"gfx1200".into(), 0x73BF|0x73A5=>"gfx1100".into(), 0x164E|0x15BF|0x1586=>"gfx1151".into(), _=>"unknown".into(), } }
+fn guess_gfx(dev_id:u32)->String{ crate::gpu::gfx_for_pci_dev(dev_id) }
 fn registry_vram_type(_idx:usize)->Option<String>{None}
 
 pub fn enrich_vram_usage(gpus: &mut Vec<GpuInfo>) {
@@ -326,7 +355,7 @@ pub fn enrich_vram_usage(gpus: &mut Vec<GpuInfo>) {
         Ok(f) => f,
         Err(_) => return,
     };
-    let gdi = match unsafe { libloading::Library::new("gdi32.dll") } {
+    let gdi = match load_lib_secure("gdi32.dll") {
         Ok(l) => l,
         Err(_) => return,
     };
@@ -401,11 +430,11 @@ pub fn enrich_vram_usage(gpus: &mut Vec<GpuInfo>) {
 
 fn query_gpu_processes(luid_map: &std::collections::HashMap<String, usize>, gpus: &mut [GpuInfo]) {
     use std::collections::HashMap;
-    let kernel32 = match unsafe { libloading::Library::new("kernel32.dll") } {
+    let kernel32 = match load_lib_secure("kernel32.dll") {
         Ok(l) => l,
         Err(_) => return,
     };
-    let pdh = match unsafe { libloading::Library::new("pdh.dll") } {
+    let pdh = match load_lib_secure("pdh.dll") {
         Ok(l) => l,
         Err(_) => return,
     };
@@ -533,15 +562,7 @@ fn query_gpu_processes(luid_map: &std::collections::HashMap<String, usize>, gpus
                                         continue;
                                     }
                                     let proc_name = pid_names.get(&pid).cloned().unwrap_or_else(|| "Unknown".to_string());
-                                    let lower_pn = proc_name.to_lowercase();
-                                    let proc_type = if lower_pn.contains("python") || lower_pn.contains("ollama")
-                                        || lower_pn.contains("llama") || lower_pn.contains("torch")
-                                        || lower_pn.contains("vllm") || lower_pn.contains("triton")
-                                        || lower_pn.contains("compute") {
-                                        "C".to_string()
-                                    } else {
-                                        "G".to_string()
-                                    };
+                                    let proc_type = crate::gpu::classify_proc_type(&proc_name);
 
                                     if let Some(existing) = gpu.processes.iter_mut().find(|p| p.pid == pid) {
                                         if val_mb > existing.mem_used_mb {

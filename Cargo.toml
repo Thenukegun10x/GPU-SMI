@@ -1,6 +1,6 @@
 [package]
 name = "gpu-smi"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "gpu-smi - portable, single-exe GPU SMI for AMD GPUs (Windows + Linux). AMD-compatible, unofficial. Uses ADL/HIP/WMI/sysfs, no driver SDK required"
 license = "MIT"

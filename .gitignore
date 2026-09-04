@@ -1,3 +1,8 @@
 /target
 *.exe
 gpu-smi-linux-x64
+# real secrets — never commit (see example.env template)
+.env
+*.env.local
+token.txt
+gpu-smi-token.txt

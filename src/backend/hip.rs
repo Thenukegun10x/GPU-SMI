@@ -29,10 +29,14 @@ pub struct HipBackend;
 
 impl Backend for HipBackend {
     fn discover(&self) -> anyhow::Result<Vec<GpuInfo>> {
-        // Try TheRock path first, then system PATH
+        // SECURITY: absolute paths first. A bare "amdhip64_*.dll" resolves via
+        // app-dir first, so a DLL planted next to this portable exe would win.
+        // Keep bare names last for PATH-based installs only.
         let candidates = [
             r"C:\TheRock\build\bin\amdhip64_7.dll",
             r"C:\TheRock\build\bin\amdhip64.dll",
+            r"C:\Windows\System32\amdhip64_7.dll",
+            r"C:\Windows\System32\amdhip64.dll",
             "amdhip64_7.dll",
             "amdhip64.dll",
             "libamdhip64.so",

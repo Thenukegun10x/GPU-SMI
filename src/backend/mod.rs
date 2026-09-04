@@ -12,13 +12,17 @@ pub fn discover_all() -> Vec<GpuInfo> {
     // Try native backend first (amdsmi on Linux, ADL/HIP/WMI on Windows), fallback chain
     #[cfg(target_os = "linux")]
     {
+        // amdsmi when present, else sysfs sensors enriched with HIP names + fdinfo processes
         if let Ok(gpus) = linux::LinuxAmdSmiBackend.discover() {
             if !gpus.is_empty() { return gpus; }
         }
-        if let Ok(gpus) = linux::LinuxSysfsBackend.discover() {
-            if !gpus.is_empty() { return gpus; }
+        let mut gpus = linux::LinuxSysfsBackend.discover().unwrap_or_default();
+        if gpus.is_empty() {
+            return hip::HipBackend.discover().unwrap_or_default();
         }
-        hip::HipBackend.discover().unwrap_or_default()
+        linux::enrich_with_hip(&mut gpus);
+        linux::enrich_processes_linux(&mut gpus);
+        gpus
     }
     #[cfg(target_os = "windows")]
     {
