@@ -19,6 +19,7 @@ pub struct GpuInfo {
     pub vram_type: String,
     pub vram_total_mb: u32,
     pub vram_used_mb: u32,
+    pub vram_pinned_mb: u32,
     pub vram_vendor: String,
     pub bdf: String, // "0000:03:00.0"
     pub pcie_width: u16,
@@ -34,6 +35,15 @@ pub struct GpuInfo {
     pub power_w: Option<f32>,
     pub power_cap_w: Option<f32>,
     pub backend: String, // "amdsmi" | "hip" | "adl" | "wmi" | "sysfs"
+    pub processes: Vec<ProcessInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub name: String,
+    pub mem_used_mb: u32,
+    pub proc_type: String, // "G" (Graphics) | "C" (Compute)
 }
 
 impl GpuInfo {

@@ -50,6 +50,8 @@ pub fn discover_all() -> Vec<GpuInfo> {
         };
         // Enrich with ADL PMLog temps/clocks/power/util/pcie (best-effort)
         windows::enrich_with_adl(&mut merged);
+        // Enrich with accurate VRAM usage and OS pinned VRAM via WDDM/DXGI
+        windows::enrich_vram_usage(&mut merged);
         return merged;
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]

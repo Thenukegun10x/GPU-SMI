@@ -1,1 +1,3 @@
 /target
+*.exe
+gpu-smi-linux-x64

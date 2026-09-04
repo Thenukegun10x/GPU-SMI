@@ -207,7 +207,7 @@ fn enrich_from_adl(gpus: &mut Vec<GpuInfo>) -> anyhow::Result<()> {
                 let bus_speed = map.get(&40).copied();
                 let bus_lanes = map.get(&41).copied();
                 let vt = adl_query_vram_type(&lib, ctx, entry.0, use_adl2_ctx).unwrap_or_else(|| vram_type_for_dev(dev.unwrap_or(0)));
-                gpus.push(GpuInfo{ index: idx as u32, market_name: cstr_to_string(&info.strAdapterName), vendor_id: 0x1002, vendor_name: "AMD".into(), device_id: dev.unwrap_or(0) as u64, subsystem_id: 0, rev_id: 0, asic_serial: String::new(), num_cu: 0, gfx_version: guess_gfx(dev.unwrap_or(0)), vram_type: vt, vram_total_mb: 0, vram_used_mb: 0, vram_vendor: String::new(), bdf: format!("{} bus {} dev {} fn {}", cstr_to_string(&info.strUDID), info.iBusNumber, info.iDeviceNumber, info.iFunctionNumber), pcie_width: bus_lanes.unwrap_or(0) as u16, pcie_speed_gt: bus_speed.unwrap_or(0)/1000, driver_version: cstr_to_string(&info.strDriverPath), vbios_version: String::new(), temp_edge_c: temp_edge.map(|v| v as f32), temp_hotspot_c: temp_hotspot.map(|v| v as f32), temp_vram_c: temp_mem.map(|v| v as f32), gfx_clock_mhz: gfxclk, mem_clock_mhz: memclk, gfx_util_percent: gfx_act, power_w: board_power.or(asic_power).or(gfx_power).map(|v| v as f32/10.0), power_cap_w: None, backend: "adl-pmlog".into(), });
+                gpus.push(GpuInfo{ index: idx as u32, market_name: cstr_to_string(&info.strAdapterName), vendor_id: 0x1002, vendor_name: "AMD".into(), device_id: dev.unwrap_or(0) as u64, subsystem_id: 0, rev_id: 0, asic_serial: String::new(), num_cu: 0, gfx_version: guess_gfx(dev.unwrap_or(0)), vram_type: vt, vram_total_mb: 0, vram_used_mb: 0, vram_pinned_mb: 0, vram_vendor: String::new(), bdf: format!("{} bus {} dev {} fn {}", cstr_to_string(&info.strUDID), info.iBusNumber, info.iDeviceNumber, info.iFunctionNumber), pcie_width: bus_lanes.unwrap_or(0) as u16, pcie_speed_gt: bus_speed.unwrap_or(0)/1000, driver_version: cstr_to_string(&info.strDriverPath), vbios_version: String::new(), temp_edge_c: temp_edge.map(|v| v as f32), temp_hotspot_c: temp_hotspot.map(|v| v as f32), temp_vram_c: temp_mem.map(|v| v as f32), gfx_clock_mhz: gfxclk, mem_clock_mhz: memclk, gfx_util_percent: gfx_act, power_w: board_power.or(asic_power).or(gfx_power).map(|v| v as f32/10.0), power_cap_w: None, backend: "adl-pmlog".into(), processes: Vec::new(), });
             }
         } else {
             for (i, gpu) in gpus.iter_mut().enumerate() {
@@ -315,7 +315,257 @@ fn vram_type_for_dev(dev: u32) -> String {
     }
 }
 pub struct WmiBackend;
-impl Backend for WmiBackend { fn discover(&self) -> anyhow::Result<Vec<GpuInfo>> { let ps = r#"Get-CimInstance Win32_VideoController | Where-Object { $_.PNPDeviceID -like 'PCI\VEN_1002*' } | Select-Object Name,PNPDeviceID,DriverVersion,AdapterRAM | ConvertTo-Json -Compress"#; let out = Command::new("powershell").args(["-NoProfile","-Command",ps]).output()?; let txt=String::from_utf8_lossy(&out.stdout).trim().to_string(); if txt.is_empty()||txt=="null"{anyhow::bail!("no AMD GPU via WMI");} let json_str=if txt.trim_start().starts_with('['){txt}else{format!("[{}]",txt)}; let vals:serde_json::Value=serde_json::from_str(&json_str)?; let mut gpus=Vec::new(); if let Some(arr)=vals.as_array(){ for(i,v) in arr.iter().enumerate(){ let name=v.get("Name").and_then(|x|x.as_str()).unwrap_or("AMD GPU").to_string(); let pnp=v.get("PNPDeviceID").and_then(|x|x.as_str()).unwrap_or(""); let dev=extract_hex(pnp,"DEV_"); let sub=extract_hex(pnp,"SUBSYS_"); let rev=extract_hex(pnp,"REV_"); let ram=v.get("AdapterRAM").and_then(|x|x.as_u64()).unwrap_or(0); let drv=v.get("DriverVersion").and_then(|x|x.as_str()).unwrap_or("").to_string(); let vt = registry_vram_type(i).unwrap_or_else(|| vram_type_for_dev(dev.unwrap_or(0))); gpus.push(GpuInfo{ index:i as u32, market_name:name, vendor_id:0x1002, vendor_name:"Advanced Micro Devices, Inc. [AMD/ATI]".into(), device_id:dev.unwrap_or(0) as u64, subsystem_id:sub.unwrap_or(0) as u32, rev_id:rev.unwrap_or(0) as u32, asic_serial:String::new(), num_cu:0, gfx_version:guess_gfx(dev.unwrap_or(0)), vram_type: vt, vram_total_mb:(ram/1024/1024) as u32, vram_used_mb:0, vram_vendor:String::new(), bdf:pnp.to_string(), pcie_width:0, pcie_speed_gt:0, driver_version:drv, vbios_version:String::new(), temp_edge_c:None, temp_hotspot_c:None, temp_vram_c:None, gfx_clock_mhz:None, mem_clock_mhz:None, gfx_util_percent:None, power_w:None, power_cap_w:None, backend:"wmi".into(), }); } } if gpus.is_empty(){anyhow::bail!("no AMD WMI entries");} Ok(gpus) } }
+impl Backend for WmiBackend { fn discover(&self) -> anyhow::Result<Vec<GpuInfo>> { let ps = r#"Get-CimInstance Win32_VideoController | Where-Object { $_.PNPDeviceID -like 'PCI\VEN_1002*' } | Select-Object Name,PNPDeviceID,DriverVersion,AdapterRAM | ConvertTo-Json -Compress"#; let out = Command::new("powershell").args(["-NoProfile","-Command",ps]).output()?; let txt=String::from_utf8_lossy(&out.stdout).trim().to_string(); if txt.is_empty()||txt=="null"{anyhow::bail!("no AMD GPU via WMI");} let json_str=if txt.trim_start().starts_with('['){txt}else{format!("[{}]",txt)}; let vals:serde_json::Value=serde_json::from_str(&json_str)?; let mut gpus=Vec::new(); if let Some(arr)=vals.as_array(){ for(i,v) in arr.iter().enumerate(){ let name=v.get("Name").and_then(|x|x.as_str()).unwrap_or("AMD GPU").to_string(); let pnp=v.get("PNPDeviceID").and_then(|x|x.as_str()).unwrap_or(""); let dev=extract_hex(pnp,"DEV_"); let sub=extract_hex(pnp,"SUBSYS_"); let rev=extract_hex(pnp,"REV_"); let ram=v.get("AdapterRAM").and_then(|x|x.as_u64()).unwrap_or(0); let drv=v.get("DriverVersion").and_then(|x|x.as_str()).unwrap_or("").to_string(); let vt = registry_vram_type(i).unwrap_or_else(|| vram_type_for_dev(dev.unwrap_or(0))); gpus.push(GpuInfo{ index:i as u32, market_name:name, vendor_id:0x1002, vendor_name:"Advanced Micro Devices, Inc. [AMD/ATI]".into(), device_id:dev.unwrap_or(0) as u64, subsystem_id:sub.unwrap_or(0) as u32, rev_id:rev.unwrap_or(0) as u32, asic_serial:String::new(), num_cu:0, gfx_version:guess_gfx(dev.unwrap_or(0)), vram_type: vt, vram_total_mb:(ram/1024/1024) as u32, vram_used_mb:0, vram_pinned_mb:0, vram_vendor:String::new(), bdf:pnp.to_string(), pcie_width:0, pcie_speed_gt:0, driver_version:drv, vbios_version:String::new(), temp_edge_c:None, temp_hotspot_c:None, temp_vram_c:None, gfx_clock_mhz:None, mem_clock_mhz:None, gfx_util_percent:None, power_w:None, power_cap_w:None, backend:"wmi".into(), processes: Vec::new(), }); } } if gpus.is_empty(){anyhow::bail!("no AMD WMI entries");} Ok(gpus) } }
 fn extract_hex(s:&str,key:&str)->Option<u32>{ s.find(key).and_then(|i|{ let hex=&s[i+key.len()..]; let end=hex.find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(hex.len().min(8)); u32::from_str_radix(&hex[..end],16).ok() }) }
 fn guess_gfx(dev_id:u32)->String{ match dev_id { 0x744C|0x7550|0x7448|0x7460=>"gfx1201".into(), 0x7470..=0x74AF=>"gfx1200".into(), 0x73BF|0x73A5=>"gfx1100".into(), 0x164E|0x15BF|0x1586=>"gfx1151".into(), _=>"unknown".into(), } }
 fn registry_vram_type(_idx:usize)->Option<String>{None}
+
+pub fn enrich_vram_usage(gpus: &mut Vec<GpuInfo>) {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+    let factory: IDXGIFactory1 = match unsafe { CreateDXGIFactory1() } {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let gdi = match unsafe { libloading::Library::new("gdi32.dll") } {
+        Ok(l) => l,
+        Err(_) => return,
+    };
+    let query_stats = match unsafe { gdi.get::<unsafe extern "system" fn(*mut u8) -> i32>(b"D3DKMTQueryStatistics") } {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    let mut luid_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut i = 0;
+    while let Ok(adapter) = unsafe { factory.EnumAdapters1(i) } {
+        if let Ok(desc) = unsafe { adapter.GetDesc1() } {
+            let luid_str = format!("0x{:08x}_0x{:08x}", desc.AdapterLuid.HighPart, desc.AdapterLuid.LowPart).to_lowercase();
+            let dev_id = desc.DeviceId as u64;
+            let gpu_idx = gpus.iter().position(|g| (g.device_id != 0 && g.device_id == dev_id) || (g.device_id == 0 && g.index == i));
+            if let Some(idx) = gpu_idx {
+                luid_map.insert(luid_str, idx);
+                let gpu = &mut gpus[idx];
+                let mut buf = [0u8; 0x340];
+                buf[0] = 0; // Type = 0 (ADAPTER)
+                buf[4..8].copy_from_slice(&desc.AdapterLuid.LowPart.to_ne_bytes());
+                buf[8..12].copy_from_slice(&desc.AdapterLuid.HighPart.to_ne_bytes());
+                let ret = unsafe { query_stats(buf.as_mut_ptr()) };
+                if ret == 0 {
+                    let nb_segments = u32::from_ne_bytes(buf[24..28].try_into().unwrap_or([0; 4]));
+                    let mut total_resident: u64 = 0;
+                    let mut total_committed: u64 = 0;
+                    let mut total_limit: u64 = 0;
+                    let mut has_dedicated = false;
+
+                    for seg in 0..nb_segments {
+                        let mut sbuf = [0u8; 0x340];
+                        sbuf[0] = 3; // D3DKMT_QUERYSTATISTICS_SEGMENT
+                        sbuf[4..8].copy_from_slice(&desc.AdapterLuid.LowPart.to_ne_bytes());
+                        sbuf[8..12].copy_from_slice(&desc.AdapterLuid.HighPart.to_ne_bytes());
+                        sbuf[0x320..0x324].copy_from_slice(&seg.to_ne_bytes());
+                        let sret = unsafe { query_stats(sbuf.as_mut_ptr()) };
+                        if sret == 0 {
+                            let commit_limit = u64::from_ne_bytes(sbuf[24..32].try_into().unwrap_or([0; 8]));
+                            let bytes_committed = u64::from_ne_bytes(sbuf[32..40].try_into().unwrap_or([0; 8]));
+                            let bytes_resident = u64::from_ne_bytes(sbuf[40..48].try_into().unwrap_or([0; 8]));
+                            let aperture = u32::from_ne_bytes(sbuf[64..68].try_into().unwrap_or([0; 4]));
+
+                            if aperture == 0 && commit_limit > 0 {
+                                has_dedicated = true;
+                                total_resident += bytes_resident;
+                                total_committed += bytes_committed;
+                                total_limit += commit_limit;
+                            }
+                        }
+                    }
+
+                    if has_dedicated {
+                        let used_mb = (total_resident / (1024 * 1024)) as u32;
+                        let committed_mb = (total_committed / (1024 * 1024)) as u32;
+                        gpu.vram_used_mb = used_mb;
+                        if used_mb > committed_mb {
+                            gpu.vram_pinned_mb = used_mb - committed_mb;
+                        }
+                        if gpu.vram_total_mb == 0 && total_limit > 0 {
+                            gpu.vram_total_mb = (total_limit / (1024 * 1024)) as u32;
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+
+    query_gpu_processes(&luid_map, gpus);
+}
+
+fn query_gpu_processes(luid_map: &std::collections::HashMap<String, usize>, gpus: &mut [GpuInfo]) {
+    use std::collections::HashMap;
+    let kernel32 = match unsafe { libloading::Library::new("kernel32.dll") } {
+        Ok(l) => l,
+        Err(_) => return,
+    };
+    let pdh = match unsafe { libloading::Library::new("pdh.dll") } {
+        Ok(l) => l,
+        Err(_) => return,
+    };
+
+    #[repr(C)]
+    struct PROCESSENTRY32W {
+        dw_size: u32,
+        cnt_usage: u32,
+        th32_process_id: u32,
+        th32_default_heap_id: usize,
+        th32_module_id: u32,
+        cnt_threads: u32,
+        th32_parent_process_id: u32,
+        pc_pri_class_base: i32,
+        dw_flags: u32,
+        sz_exe_file: [u16; 260],
+    }
+    let create_snapshot = match unsafe { kernel32.get::<unsafe extern "system" fn(u32, u32) -> *mut c_void>(b"CreateToolhelp32Snapshot") } {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let proc_first = match unsafe { kernel32.get::<unsafe extern "system" fn(*mut c_void, *mut PROCESSENTRY32W) -> i32>(b"Process32FirstW") } {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let proc_next = match unsafe { kernel32.get::<unsafe extern "system" fn(*mut c_void, *mut PROCESSENTRY32W) -> i32>(b"Process32NextW") } {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let close_handle = match unsafe { kernel32.get::<unsafe extern "system" fn(*mut c_void) -> i32>(b"CloseHandle") } {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    let mut pid_names: HashMap<u32, String> = HashMap::new();
+    unsafe {
+        let snap = create_snapshot(0x00000002, 0); // TH32CS_SNAPPROCESS = 2
+        if !snap.is_null() && snap as isize != -1 {
+            let mut pe = std::mem::zeroed::<PROCESSENTRY32W>();
+            pe.dw_size = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            if proc_first(snap, &mut pe) != 0 {
+                loop {
+                    let end = pe.sz_exe_file.iter().position(|&c| c == 0).unwrap_or(pe.sz_exe_file.len());
+                    let name = String::from_utf16_lossy(&pe.sz_exe_file[..end]);
+                    pid_names.insert(pe.th32_process_id, name);
+                    if proc_next(snap, &mut pe) == 0 {
+                        break;
+                    }
+                }
+            }
+            close_handle(snap);
+        }
+    }
+
+    #[repr(C)]
+    struct PDH_FMT_COUNTERVALUE {
+        cstatus: u32,
+        large_value: i64,
+    }
+    #[repr(C)]
+    struct PDH_FMT_COUNTERVALUE_ITEM_W {
+        sz_name: *mut u16,
+        fmt_value: PDH_FMT_COUNTERVALUE,
+    }
+
+    let open_query = match unsafe { pdh.get::<unsafe extern "system" fn(*const u16, usize, *mut usize) -> i32>(b"PdhOpenQueryW") } {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let add_counter = match unsafe { pdh.get::<unsafe extern "system" fn(usize, *const u16, usize, *mut usize) -> i32>(b"PdhAddEnglishCounterW") } {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let collect_data = match unsafe { pdh.get::<unsafe extern "system" fn(usize) -> i32>(b"PdhCollectQueryData") } {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let get_array = match unsafe { pdh.get::<unsafe extern "system" fn(usize, u32, *mut u32, *mut u32, *mut PDH_FMT_COUNTERVALUE_ITEM_W) -> i32>(b"PdhGetFormattedCounterArrayW") } {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let close_query = match unsafe { pdh.get::<unsafe extern "system" fn(usize) -> i32>(b"PdhCloseQuery") } {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    let mut query: usize = 0;
+    let mut counter: usize = 0;
+    let path: Vec<u16> = "\\GPU Process Memory(*)\\Dedicated Usage\0".encode_utf16().collect();
+
+    unsafe {
+        if open_query(std::ptr::null(), 0, &mut query) == 0 {
+            if add_counter(query, path.as_ptr(), 0, &mut counter) == 0 {
+                collect_data(query);
+                let mut buffer_size: u32 = 0;
+                let mut item_count: u32 = 0;
+                let _ = get_array(counter, 0x00000400, &mut buffer_size, &mut item_count, std::ptr::null_mut());
+                if buffer_size > 0 {
+                    let mut buffer: Vec<u8> = vec![0u8; buffer_size as usize];
+                    if get_array(counter, 0x00000400, &mut buffer_size, &mut item_count, buffer.as_mut_ptr() as *mut _) == 0 {
+                        let items = std::slice::from_raw_parts(buffer.as_ptr() as *const PDH_FMT_COUNTERVALUE_ITEM_W, item_count as usize);
+                        for it in items {
+                            if it.sz_name.is_null() { continue; }
+                            let mut len = 0;
+                            while *it.sz_name.add(len) != 0 { len += 1; }
+                            let slice = std::slice::from_raw_parts(it.sz_name, len);
+                            let name = String::from_utf16_lossy(slice);
+                            let val_mb = (it.fmt_value.large_value / (1024 * 1024)) as u32;
+                            if val_mb == 0 { continue; }
+
+                            let name_lower = name.to_lowercase();
+                            let pid: u32 = name_lower.strip_prefix("pid_")
+                                .and_then(|s| s.split('_').next())
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0);
+                            if pid == 0 { continue; }
+
+                            let target_gpu_idx = luid_map.iter().find_map(|(luid_pat, &idx)| {
+                                if name_lower.contains(luid_pat) { Some(idx) } else { None }
+                            });
+
+                            if let Some(gpu_idx) = target_gpu_idx {
+                                if let Some(gpu) = gpus.get_mut(gpu_idx) {
+                                    if gpu.vram_total_mb > 0 && val_mb > gpu.vram_total_mb {
+                                        continue;
+                                    }
+                                    let proc_name = pid_names.get(&pid).cloned().unwrap_or_else(|| "Unknown".to_string());
+                                    let lower_pn = proc_name.to_lowercase();
+                                    let proc_type = if lower_pn.contains("python") || lower_pn.contains("ollama")
+                                        || lower_pn.contains("llama") || lower_pn.contains("torch")
+                                        || lower_pn.contains("vllm") || lower_pn.contains("triton")
+                                        || lower_pn.contains("compute") {
+                                        "C".to_string()
+                                    } else {
+                                        "G".to_string()
+                                    };
+
+                                    if let Some(existing) = gpu.processes.iter_mut().find(|p| p.pid == pid) {
+                                        if val_mb > existing.mem_used_mb {
+                                            existing.mem_used_mb = val_mb;
+                                        }
+                                    } else {
+                                        gpu.processes.push(crate::gpu::ProcessInfo {
+                                            pid,
+                                            name: proc_name,
+                                            mem_used_mb: val_mb,
+                                            proc_type,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            close_query(query);
+        }
+    }
+
+    for gpu in gpus {
+        gpu.processes.sort_by(|a, b| b.mem_used_mb.cmp(&a.mem_used_mb));
+    }
+}

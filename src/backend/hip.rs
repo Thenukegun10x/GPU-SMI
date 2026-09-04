@@ -94,6 +94,7 @@ impl Backend for HipBackend {
                     vram_type: vram_type.into(),
                     vram_total_mb: vram_mb,
                     vram_used_mb: 0,
+                    vram_pinned_mb: 0,
                     vram_vendor: String::new(),
                     bdf: String::new(),
                     pcie_width: 0,
@@ -109,6 +110,7 @@ impl Backend for HipBackend {
                     power_w: None,
                     power_cap_w: None,
                     backend: "hip".into(),
+                    processes: Vec::new(),
                 });
             }
             Ok(gpus)

@@ -13,6 +13,7 @@
 ## Features
 
 * **Single exe** `913KB` (`--release lto+strip`) — `dumpbin /DEPENDENTS` only `kernel32`, `VCRUNTIME140`, `UCRT` (inbox on Win10/11). `atiadlxx.dll` is loaded from the AMD driver if present, else falls back to `WMI`. `amdhip64_7.dll` from `TheRock` (`C:\TheRock\build\bin`) is optional.
+* **Process Tracking** — Live per-process GPU attribution (`PID`, `Name`, `Type` C=Compute/G=Graphics, dedicated `Memory Usage`), matching WDDM LUIDs across multiple GPUs without external tools or admin privileges.
 * **Auto-discovery** `HIP (TheRock) -> ADL (PMLog `ADL2_New_QueryPMLogData_Get`) -> WMI -> sysfs` with `ADL` `PMLog` temps/clocks/power/util live, `PCIe` width, `DDR5/DDR4/LPDDR/GDDR5/HBM2` `VRAM type` autodetected (not hardcoded `GDDR6`).
 * **Headless API** for apps: `--json` / `--compact` pipe, `--serve 8080` `HTTP` `GET /` `GET /metrics` `GET /health`, `--watch N` realtime `ANSI` table (memory-safe, `create/destroy` per frame, no leak).
 * **Memory safe** Rust ownership per request/frame, no shared `unsafe` state beyond `ADL`/`HIP` `dlopen` encapsulation.
@@ -20,8 +21,8 @@
 ## Quick start (Windows)
 
 ```ps
-.\gpu-smi.exe                 # one-shot table
-.\gpu-smi.exe --verbose       # BDF/CU/PCIe/hotspot
+.\gpu-smi.exe                 # one-shot table (GPU status + running processes)
+.\gpu-smi.exe --verbose       # BDF/CU/PCIe/hotspot + all processes
 .\gpu-smi.exe --json          # pretty JSON (pipe to jq)
 .\gpu-smi.exe --compact | python -c "import json,sys; print(json.load(sys.stdin)[1]['vram_total_mb'])"
 .\gpu-smi.exe --watch 1       # realtime 1s refresh (Ctrl-C to exit)
@@ -74,13 +75,23 @@ gpus = requests.get("http://127.0.0.1:8080/").json()
   "gfx_version": "gfx1201",
   "vram_type": "GDDR6",
   "vram_total_mb": 16304,
+  "vram_used_mb": 2513,
+  "vram_pinned_mb": 587,
   "temp_edge_c": 39.0,
   "temp_hotspot_c": 44.0,
   "gfx_clock_mhz": 750,
   "gfx_util_percent": 22,
   "power_w": 8.2,
   "pcie_width": 16,
-  "backend": "hip+wmi+adl"
+  "backend": "hip+wmi+adl",
+  "processes": [
+    {
+      "pid": 22232,
+      "name": "Discord.exe",
+      "mem_used_mb": 686,
+      "proc_type": "G"
+    }
+  ]
 }
 ```
 

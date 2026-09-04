@@ -61,12 +61,14 @@ impl Backend for LinuxSysfsBackend {
                 gfx_version: "unknown".into(), vram_type: "unknown".into(),
                 vram_total_mb: mem_total.trim().parse::<u64>().map(|b| (b/1024/1024) as u32).unwrap_or(0),
                 vram_used_mb: mem_used.trim().parse::<u64>().map(|b| (b/1024/1024) as u32).unwrap_or(0),
+                vram_pinned_mb: 0,
                 vram_vendor: String::new(), bdf: String::new(), pcie_width: 0, pcie_speed_gt: 0,
                 driver_version: String::new(), vbios_version: String::new(),
                 temp_edge_c: temp.trim().parse::<f32>().map(|v| v/1000.0).ok(),
                 temp_hotspot_c: None, temp_vram_c: None,
                 gfx_clock_mhz: None, mem_clock_mhz: None, gfx_util_percent: None, power_w: None, power_cap_w: None,
                 backend: "sysfs".into(),
+                processes: Vec::new(),
             });
         }
         if gpus.is_empty() { anyhow::bail!("no AMD drm cards in /sys/class/drm"); }

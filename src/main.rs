@@ -71,12 +71,17 @@ fn serve_headless(port: u16) -> anyhow::Result<()> {
                 let name = g.market_name.replace("\"","'");
                 out.push_str(&format!("amd_gpu_vram_total_mb{{id=\"{}\",name=\"{}\"}} {}\n", id, name, g.vram_total_mb));
                 out.push_str(&format!("amd_gpu_vram_used_mb{{id=\"{}\"}} {}\n", id, g.vram_used_mb));
+                out.push_str(&format!("amd_gpu_vram_pinned_mb{{id=\"{}\"}} {}\n", id, g.vram_pinned_mb));
                 if let Some(v)=g.temp_edge_c { out.push_str(&format!("amd_gpu_temp_edge_c{{id=\"{}\"}} {}\n", id, v)); }
                 if let Some(v)=g.temp_hotspot_c { out.push_str(&format!("amd_gpu_temp_hotspot_c{{id=\"{}\"}} {}\n", id, v)); }
                 if let Some(v)=g.gfx_clock_mhz { out.push_str(&format!("amd_gpu_gfx_clock_mhz{{id=\"{}\"}} {}\n", id, v)); }
                 if let Some(v)=g.mem_clock_mhz { out.push_str(&format!("amd_gpu_mem_clock_mhz{{id=\"{}\"}} {}\n", id, v)); }
                 if let Some(v)=g.gfx_util_percent { out.push_str(&format!("amd_gpu_util_percent{{id=\"{}\"}} {}\n", id, v)); }
                 if let Some(v)=g.power_w { out.push_str(&format!("amd_gpu_power_watts{{id=\"{}\"}} {}\n", id, v)); }
+                for p in &g.processes {
+                    let pname = p.name.replace("\"", "'");
+                    out.push_str(&format!("amd_gpu_process_mem_mb{{id=\"{}\",pid=\"{}\",name=\"{}\",type=\"{}\"}} {}\n", id, p.pid, pname, p.proc_type, p.mem_used_mb));
+                }
             }
             (out, "text/plain; version=0.0.4")
         } else if is_health {
@@ -110,24 +115,64 @@ fn render_once(args: &Args) -> anyhow::Result<()> {
 
     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
     println!("AMD SMI Portable | {} GPU(s) | {} | backend {} | Ctrl-C to exit", gpus.len(), ts, if args.watch.is_some() { format!("watch {}s", args.watch.unwrap_or(1)) } else { "one-shot".into() });
-    // Header now includes live sensors: Clocks, Util, Power
-    println!("{:<3} {:<28} {:<8} {:<18} {:<7} {:<7} {:<5} {:<7} {:<8}", "ID", "Name", "GFX", "VRAM", "Temp", "GCLK", "Util", "Power", "Backend");
-    println!("{}", "-".repeat(110));
+    // Header includes live sensors: VRAM (Used/Total), Pinned OS VRAM, Clocks, Util, Power
+    println!("{:<3} {:<26} {:<8} {:<23} {:<9} {:<6} {:<8} {:<6} {:<8} {:<8}", "ID", "Name", "GFX", "VRAM (Used/Total)", "Pinned", "Temp", "GCLK", "Util", "Power", "Backend");
+    println!("{}", "-".repeat(112));
     for g in &gpus {
-        let vram = if g.vram_total_mb>0 { format!("{} {}", g.vram_total_mb, g.vram_type) } else { "-".into() };
+        let vram = if g.vram_total_mb > 0 {
+            if g.vram_used_mb > 0 {
+                let pct = ((g.vram_used_mb as f64 / g.vram_total_mb as f64) * 100.0).round() as u32;
+                format!("{} / {} MB ({}%)", g.vram_used_mb, g.vram_total_mb, pct)
+            } else {
+                format!("0 / {} MB", g.vram_total_mb)
+            }
+        } else {
+            "-".into()
+        };
+        let pinned = if g.vram_pinned_mb > 0 {
+            format!("{} MB", g.vram_pinned_mb)
+        } else {
+            "-".into()
+        };
         let temp = g.temp_edge_c.map(|t| format!("{:.0}C", t)).unwrap_or("-".into());
         let gclk = g.gfx_clock_mhz.map(|v| format!("{}MHz", v)).unwrap_or("-".into());
         let util = g.gfx_util_percent.map(|v| format!("{}%", v)).unwrap_or("-".into());
         let power = g.power_w.map(|v| format!("{:.1}W", v)).unwrap_or("-".into());
-        println!("{:<3} {:<28} {:<8} {:<18} {:<7} {:<7} {:<5} {:<7} {:<8}", g.index, truncate(&g.market_name,28), g.gfx_version, truncate(&vram,18), temp, gclk, util, power, truncate(&g.backend,8));
+        println!("{:<3} {:<26} {:<8} {:<23} {:<9} {:<6} {:<8} {:<6} {:<8} {:<8}",
+            g.index, truncate(&g.market_name, 26), g.gfx_version, truncate(&vram, 23), pinned, temp, gclk, util, power, truncate(&g.backend, 8));
         if args.verbose {
             let hotspot = g.temp_hotspot_c.map(|t| format!("hotspot {:.0}C ", t)).unwrap_or_default();
             let vramt = g.temp_vram_c.map(|t| format!("vram {:.0}C ", t)).unwrap_or_default();
             let mclk = g.mem_clock_mhz.map(|v| format!("mclk {}MHz ", v)).unwrap_or_default();
-            println!("    dev=0x{:04x} {} {} {} pcie=x{} {}GT/s driver {}", g.device_id as u32, hotspot, vramt, mclk, g.pcie_width, g.pcie_speed_gt, truncate(&g.driver_version,20));
+            let free_mb = if g.vram_total_mb >= g.vram_used_mb { g.vram_total_mb - g.vram_used_mb } else { 0 };
+            println!("    dev=0x{:04x} {} {} {} pcie=x{} {}GT/s driver {} | type: {} free: {}MB",
+                g.device_id as u32, hotspot, vramt, mclk, g.pcie_width, g.pcie_speed_gt, truncate(&g.driver_version, 20), g.vram_type, free_mb);
         }
     }
-    if !args.verbose { println!("\n(--watch 1 for realtime, --verbose for hotspot/vram temps & mclk, --json dump)"); }
+
+    let mut all_procs: Vec<(u32, &crate::gpu::ProcessInfo)> = Vec::new();
+    for g in &gpus {
+        for p in &g.processes {
+            all_procs.push((g.index, p));
+        }
+    }
+    all_procs.sort_by(|a, b| b.1.mem_used_mb.cmp(&a.1.mem_used_mb));
+
+    if !all_procs.is_empty() {
+        println!("\nProcesses:");
+        println!("{:<4} {:<8} {:<6} {:<42} {:>14}", "GPU", "PID", "Type", "Process Name", "Memory Usage");
+        println!("{}", "-".repeat(76));
+        let max_show = if args.verbose { all_procs.len() } else { 20 };
+        for (gpu_idx, p) in all_procs.iter().take(max_show) {
+            println!("{:<4} {:<8} {:<6} {:<42} {:>11} MB",
+                gpu_idx, p.pid, p.proc_type, truncate(&p.name, 42), p.mem_used_mb);
+        }
+        if all_procs.len() > max_show {
+            println!("  ... and {} more processes (--verbose to show all)", all_procs.len() - max_show);
+        }
+    }
+
+    if !args.verbose { println!("\n(--watch 1 for realtime, --verbose for hotspot/vram temps, clocks & free VRAM, --json dump)"); }
     Ok(())
 }
 
