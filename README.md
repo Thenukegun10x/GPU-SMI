@@ -63,7 +63,26 @@ gpus = requests.get("http://127.0.0.1:8080/").json()
 # http://127.0.0.1:8080/metrics  -> amd_gpu_vram_total_mb{id="1"} 16304
 ```
 
-`GET /` -> `application/json` `Vec<GpuInfo>`, `GET /metrics` -> `text/plain; version=0.0.4` Prometheus, `GET /health` -> `{"status":"ok"}`, `CORS: *`.
+`GET /` -> `application/json` `Vec<GpuInfo>`, `GET /metrics` -> `text/plain; version=0.0.4` Prometheus, `GET /health` -> `{"status":"ok"}` (open, no auth). No CORS header is sent (a wildcard would let any website scrape your process list); non-loopback `--listen` requires a bearer token, `/health` stays open for probes.
+
+### Python wrapper (no JSON parsing needed)
+
+```sh
+pip install ./python        # or pip install gpu-smi once published
+```
+
+```py
+import gpu_smi
+for gpu in gpu_smi.gpus():
+    print(gpu.summary())    # [1] AMD Radeon RX 9070 XT | VRAM 2513/16304 MB (15%) | 39C | ...
+    for p in gpu.processes:
+        print(p.pid, p.name, p.mem_mb)
+
+rows = gpu_smi.query_raw()  # power users: raw list[dict], untouched
+with gpu_smi.serve(port=8080, token=True) as api:  # spawned server + auto token
+    print(api.metrics())
+```
+See [`python/README.md`](python/README.md). Needs the `gpu-smi` binary on `PATH` (or `GPU_SMI_BIN`).
 
 ### Schema (`GpuInfo` mirrors `amdsmi_asic_info_t` + `amdsmi_pcie_info_t`)
 

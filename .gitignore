@@ -6,3 +6,9 @@ gpu-smi-linux-x64
 *.env.local
 token.txt
 gpu-smi-token.txt
+# python wrapper build/test artifacts
+__pycache__/
+*.egg-info/
+python/dist/
+python/build/
+.pytest_cache/

@@ -521,69 +521,86 @@ fn query_gpu_processes(luid_map: &std::collections::HashMap<String, usize>, gpus
         Err(_) => return,
     };
 
-    let mut query: usize = 0;
-    let mut counter: usize = 0;
-    let path: Vec<u16> = "\\GPU Process Memory(*)\\Dedicated Usage\0".encode_utf16().collect();
+    let path_local: Vec<u16> = "\\GPU Process Memory(*)\\Local Usage\0".encode_utf16().collect();
+    let path_shared: Vec<u16> = "\\GPU Process Memory(*)\\Shared Usage\0".encode_utf16().collect();
 
-    unsafe {
-        if open_query(std::ptr::null(), 0, &mut query) == 0 {
-            if add_counter(query, path.as_ptr(), 0, &mut counter) == 0 {
-                collect_data(query);
-                let mut buffer_size: u32 = 0;
-                let mut item_count: u32 = 0;
-                let _ = get_array(counter, 0x00000400, &mut buffer_size, &mut item_count, std::ptr::null_mut());
-                if buffer_size > 0 {
-                    let mut buffer: Vec<u8> = vec![0u8; buffer_size as usize];
-                    if get_array(counter, 0x00000400, &mut buffer_size, &mut item_count, buffer.as_mut_ptr() as *mut _) == 0 {
-                        let items = std::slice::from_raw_parts(buffer.as_ptr() as *const PDH_FMT_COUNTERVALUE_ITEM_W, item_count as usize);
-                        for it in items {
-                            if it.sz_name.is_null() { continue; }
-                            let mut len = 0;
-                            while *it.sz_name.add(len) != 0 { len += 1; }
-                            let slice = std::slice::from_raw_parts(it.sz_name, len);
-                            let name = String::from_utf16_lossy(slice);
-                            let val_mb = (it.fmt_value.large_value / (1024 * 1024)) as u32;
-                            if val_mb == 0 { continue; }
+    let mut collect_counter_data = |counter_path: &[u16], is_shared: bool, gpus: &mut [GpuInfo]| {
+        unsafe {
+            let mut query: usize = 0;
+            let mut counter: usize = 0;
+            if open_query(std::ptr::null(), 0, &mut query) == 0 {
+                if add_counter(query, counter_path.as_ptr(), 0, &mut counter) == 0 {
+                    collect_data(query);
+                    let mut buffer_size: u32 = 0;
+                    let mut item_count: u32 = 0;
+                    let _ = get_array(counter, 0x00000400, &mut buffer_size, &mut item_count, std::ptr::null_mut());
+                    if buffer_size > 0 {
+                        let mut buffer: Vec<u8> = vec![0u8; buffer_size as usize];
+                        if get_array(counter, 0x00000400, &mut buffer_size, &mut item_count, buffer.as_mut_ptr() as *mut _) == 0 {
+                            let items = std::slice::from_raw_parts(buffer.as_ptr() as *const PDH_FMT_COUNTERVALUE_ITEM_W, item_count as usize);
+                            for it in items {
+                                if it.sz_name.is_null() { continue; }
+                                let mut len = 0;
+                                while *it.sz_name.add(len) != 0 { len += 1; }
+                                let slice = std::slice::from_raw_parts(it.sz_name, len);
+                                let name = String::from_utf16_lossy(slice);
+                                let val_mb = (it.fmt_value.large_value / (1024 * 1024)) as u32;
+                                if val_mb == 0 { continue; }
 
-                            let name_lower = name.to_lowercase();
-                            let pid: u32 = name_lower.strip_prefix("pid_")
-                                .and_then(|s| s.split('_').next())
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(0);
-                            if pid == 0 { continue; }
+                                let name_lower = name.to_lowercase();
+                                let pid: u32 = name_lower.strip_prefix("pid_")
+                                    .and_then(|s| s.split('_').next())
+                                    .and_then(|s| s.parse().ok())
+                                    .unwrap_or(0);
+                                if pid == 0 { continue; }
 
-                            let target_gpu_idx = luid_map.iter().find_map(|(luid_pat, &idx)| {
-                                if name_lower.contains(luid_pat) { Some(idx) } else { None }
-                            });
+                                let target_gpu_idx = luid_map.iter().find_map(|(luid_pat, &idx)| {
+                                    if name_lower.contains(luid_pat) { Some(idx) } else { None }
+                                });
 
-                            if let Some(gpu_idx) = target_gpu_idx {
-                                if let Some(gpu) = gpus.get_mut(gpu_idx) {
-                                    if gpu.vram_total_mb > 0 && val_mb > gpu.vram_total_mb {
-                                        continue;
-                                    }
-                                    let proc_name = pid_names.get(&pid).cloned().unwrap_or_else(|| "Unknown".to_string());
-                                    let proc_type = crate::gpu::classify_proc_type(&proc_name);
-
-                                    if let Some(existing) = gpu.processes.iter_mut().find(|p| p.pid == pid) {
-                                        if val_mb > existing.mem_used_mb {
-                                            existing.mem_used_mb = val_mb;
+                                if let Some(gpu_idx) = target_gpu_idx {
+                                    if let Some(gpu) = gpus.get_mut(gpu_idx) {
+                                        // For discrete GPUs with dedicated VRAM, only use Local Usage.
+                                        // Only consider Shared Usage for APUs/iGPUs (shared memory) if no local usage was recorded.
+                                        if is_shared && !gpu.vram_type.contains("Shared") {
+                                            continue;
                                         }
-                                    } else {
-                                        gpu.processes.push(crate::gpu::ProcessInfo {
-                                            pid,
-                                            name: proc_name,
-                                            mem_used_mb: val_mb,
-                                            proc_type,
-                                        });
+                                        if gpu.vram_total_mb > 0 && val_mb > gpu.vram_total_mb {
+                                            continue;
+                                        }
+                                        let proc_name = pid_names.get(&pid).cloned().unwrap_or_else(|| "Unknown".to_string());
+                                        let proc_type = crate::gpu::classify_proc_type(&proc_name);
+
+                                        if let Some(existing) = gpu.processes.iter_mut().find(|p| p.pid == pid) {
+                                            if val_mb > existing.mem_used_mb {
+                                                existing.mem_used_mb = val_mb;
+                                            }
+                                        } else {
+                                            gpu.processes.push(crate::gpu::ProcessInfo {
+                                                pid,
+                                                name: proc_name,
+                                                mem_used_mb: val_mb,
+                                                proc_type,
+                                            });
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                 }
+                close_query(query);
             }
-            close_query(query);
         }
+    };
+
+    // First collect physical VRAM (Local Usage)
+    collect_counter_data(&path_local, false, gpus);
+
+    // If any APU / shared-memory GPU has no processes, query Shared Usage as fallback
+    let needs_shared = gpus.iter().any(|g| g.vram_type.contains("Shared") && g.processes.is_empty());
+    if needs_shared {
+        collect_counter_data(&path_shared, true, gpus);
     }
 
     for gpu in gpus {
