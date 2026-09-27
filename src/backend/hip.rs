@@ -64,11 +64,28 @@ impl Backend for HipBackend {
                 if ret != 0 { continue; }
                 let name = CStr::from_ptr(prop.name.as_ptr()).to_string_lossy().to_string();
                 let vram_mb = (prop.totalGlobalMem / (1024*1024)) as u32;
-                // Try to map name to gfx version via simple table (TheRock gfx1200/1201 = RDNA4)
-                let gfx = if name.contains("780M") || name.contains("8060S") || name.contains("Radeon(TM) Graphics") { "gfx1151" }
-                    else if name.contains("7900") || name.contains("RX 7900") { "gfx1100" }
-                    else if name.contains("9070") || name.contains("RX 90") { "gfx1201" }
-                    else { "unknown" };
+                // Arch is NOT derivable from the adapter name: "AMD Radeon(TM)
+                // Graphics" is reported by Raphael (gfx1036), Phoenix (gfx1103),
+                // Strix Halo (gfx1151) and more, so guessing gfx1151 here
+                // mislabels every one of them. Windows HIP exposes the PCI bus
+                // (see hipDeviceGetPCIBusId) but not the device id, so only
+                // claim an arch for unambiguous model names; otherwise leave
+                // "unknown" and let the WMI merge fill it from the PCI id.
+                let gfx = if name.contains("780M") || name.contains("760M") {
+                    "gfx1103" // Phoenix / Hawk Point iGPU
+                } else if name.contains("8060S") || name.contains("8050S") {
+                    "gfx1151" // Strix Halo iGPU
+                } else if name.contains("890M") || name.contains("880M") {
+                    "gfx1150" // Strix Point iGPU
+                } else if name.contains("7900") {
+                    "gfx1100" // Navi31
+                } else if name.contains("9070") {
+                    "gfx1201" // Navi48
+                } else if name.contains("9060") {
+                    "gfx1200" // Navi44
+                } else {
+                    "unknown"
+                };
                 // VRAM type: iGPU uses system RAM (DDR4/DDR5/LPDDR4/5) autodetected via WMI when possible, dGPU GDDR/HBM via DEV table
                 let vram_type = if gfx=="gfx1151" || name.contains("Radeon(TM) Graphics") || name.contains("780M") || name.contains("860M") || name.contains("880M") {
                     #[cfg(target_os="windows")]

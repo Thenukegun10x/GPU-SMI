@@ -70,8 +70,10 @@ pub fn gfx_for_pci_dev(dev: u32) -> String {
         0x73BF | 0x73A5 => "gfx1030",          // Navi21: RX 6800/6900/6950XT
         0x73DF => "gfx1031",                   // Navi22: RX 6700
         0x73FF => "gfx1032",                   // Navi23: RX 6600
-        0x164E => "gfx1036",                   // Raphael iGPU
+        0x164E => "gfx1036",                   // Raphael iGPU (RDNA2)
         0x15BF => "gfx1103",                   // Phoenix/Hawk Point iGPU
+        0x150E => "gfx1150",                   // Strix Point iGPU (Radeon 880M/890M)
+        0x1586 => "gfx1151",                   // Strix Halo iGPU (Radeon 8050S/8060S)
         _ => "unknown",
     }
     .to_string()
@@ -107,6 +109,8 @@ mod tests {
         assert_eq!(gfx_for_pci_dev(0x73BF), "gfx1030"); // 6900 XT, was mislabeled gfx1100
         assert_eq!(gfx_for_pci_dev(0x164E), "gfx1036"); // Raphael, was mislabeled gfx1151
         assert_eq!(gfx_for_pci_dev(0x15BF), "gfx1103"); // Phoenix, was mislabeled gfx1151
+        assert_eq!(gfx_for_pci_dev(0x150E), "gfx1150"); // Strix Point (Radeon 880M/890M)
+        assert_eq!(gfx_for_pci_dev(0x1586), "gfx1151"); // Strix Halo (Radeon 8050S/8060S)
         assert_eq!(gfx_for_pci_dev(0x1234), "unknown");
     }
 

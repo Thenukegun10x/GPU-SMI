@@ -38,7 +38,16 @@ pub fn discover_all() -> Vec<GpuInfo> {
                     h.rev_id = w.rev_id;
                     h.bdf = w.bdf.clone();
                     h.driver_version = w.driver_version.clone();
-                    if h.gfx_version == "unknown" { h.gfx_version = w.gfx_version.clone(); }
+                    // The PCI device id (WMI PNPDeviceID) is the authoritative
+                    // arch source; the HIP backend only sees a marketing name
+                    // that several different dies share. Derive gfx from the
+                    // device id and only fall back to HIP's name guess.
+                    let pci_gfx = crate::gpu::gfx_for_pci_dev(h.device_id as u32);
+                    if pci_gfx != "unknown" {
+                        h.gfx_version = pci_gfx;
+                    } else if h.gfx_version == "unknown" {
+                        h.gfx_version = w.gfx_version.clone();
+                    }
                     if h.vram_total_mb == 0 { h.vram_total_mb = w.vram_total_mb; }
                     h.backend = format!("hip+wmi");
                 }
